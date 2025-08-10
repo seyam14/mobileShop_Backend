@@ -9,7 +9,6 @@ const cloudinary = require('cloudinary').v2;
 const bcrypt = require('bcryptjs');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
-const { OAuth2Client } = require('google-auth-library');
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -25,9 +24,6 @@ cloudinary.config({
   api_key: process.env.CLOUD_API_KEY,
   api_secret: process.env.CLOUD_API_SECRET,
 });
-
-// ---------- Google OAuth client ----------
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // ---------- MongoDB Setup ----------
 const client = new MongoClient(process.env.MONGO_URI, {
@@ -95,7 +91,8 @@ app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 app.post('/api/register', async (req, res) => {
   try {
     const { email, password, role, name } = req.body;
-    if (!email || !password) return res.status(400).send({ message: 'Email and password required' });
+    if (!email || !password)
+      return res.status(400).send({ message: 'Email and password required' });
 
     const existing = await usersCollection.findOne({ email });
     if (existing) return res.status(400).send({ message: 'User already exists' });
@@ -126,83 +123,31 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).send({ message: 'Email and password required' });
+    if (!email || !password)
+      return res.status(400).send({ message: 'Email and password required' });
 
     const user = await usersCollection.findOne({ email });
     if (!user) return res.status(401).send({ message: 'Invalid credentials' });
 
-    // If user was created by Google and has no password
-    if (!user.password) return res.status(400).send({ message: 'Please login with Google or set a password' });
+    if (!user.password)
+      return res.status(400).send({ message: 'Please login with your password' });
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).send({ message: 'Invalid credentials' });
 
-    const token = jwt.sign({ email: user.email, role: user.role || 'user' }, process.env.JWT_SECRET, {
-      expiresIn: '7d',
-    });
+    const token = jwt.sign(
+      { email: user.email, role: user.role || 'user' },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
 
-    res.send({ token, user: { email: user.email, role: user.role, name: user.name || null } });
+    res.send({
+      token,
+      user: { email: user.email, role: user.role, name: user.name || null },
+    });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).send({ message: 'Server error during login' });
-  }
-});
-
-/**
- * @swagger
- * /api/google-login:
- *   post:
- *     summary: Login or register using Google OAuth
- */
-app.post('/api/google-login', async (req, res) => {
-  try {
-    const { token } = req.body;
-    if (!token) return res.status(400).send({ message: 'No token provided' });
-
-    const ticket = await googleClient.verifyIdToken({
-      idToken: token,
-      audience: process.env.GOOGLE_CLIENT_ID,
-    });
-
-    const payload = ticket.getPayload();
-    const email = payload.email;
-    const name = payload.name;
-    const picture = payload.picture;
-
-    // Find or create user
-    let user = await usersCollection.findOne({ email });
-
-    if (!user) {
-      const newUser = {
-        email,
-        name: name || null,
-        picture: picture || null,
-        password: null, // no local password
-        role: 'user',
-        provider: 'google',
-        createdAt: new Date(),
-      };
-      const insertRes = await usersCollection.insertOne(newUser);
-      newUser._id = insertRes.insertedId;
-      user = newUser;
-    } else {
-      // If user exists but provider not set, optionally set provider to google
-      if (!user.provider) {
-        await usersCollection.updateOne({ _id: user._id }, { $set: { provider: user.provider || 'google' } });
-      }
-    }
-
-    const jwtToken = jwt.sign({ email: user.email, role: user.role || 'user' }, process.env.JWT_SECRET, {
-      expiresIn: '7d',
-    });
-
-    res.send({
-      token: jwtToken,
-      user: { email: user.email, role: user.role, name: user.name || null, picture: user.picture || null },
-    });
-  } catch (err) {
-    console.error('Google login error:', err);
-    res.status(500).send({ message: 'Google login failed' });
   }
 });
 
@@ -234,10 +179,13 @@ app.post('/api/upload', async (req, res) => {
  * @swagger
  * /api/products:
  *   post:
- *     summary: Create a product
+ *     summary: Create a product (admin only)
  */
-app.post('/api/products', async (req, res) => {
+app.post('/api/products', verifyToken, async (req, res) => {
   try {
+    if (req.user.role !== 'admin')
+      return res.status(403).send({ message: 'Forbidden: Admins only' });
+
     const product = req.body;
     product.createdAt = new Date();
     const result = await productsCollection.insertOne(product);
@@ -262,7 +210,6 @@ app.get('/api/products', async (req, res) => {
     if (category) filter.category = category;
     if (company) filter.company = company;
     if (q) {
-      // simple text search across some fields
       filter.$or = [
         { name: { $regex: q, $options: 'i' } },
         { description: { $regex: q, $options: 'i' } },
@@ -281,14 +228,21 @@ app.get('/api/products', async (req, res) => {
 /**
  * Update product by id
  */
-app.put('/api/products/:id', async (req, res) => {
+app.put('/api/products/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const updatedProduct = req.body;
 
-    const result = await productsCollection.updateOne({ _id: new ObjectId(id) }, { $set: updatedProduct });
+    if (req.user.role !== 'admin')
+      return res.status(403).send({ message: 'Forbidden: Admins only' });
 
-    if (result.matchedCount === 0) return res.status(404).send({ message: 'Product not found' });
+    const result = await productsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updatedProduct }
+    );
+
+    if (result.matchedCount === 0)
+      return res.status(404).send({ message: 'Product not found' });
 
     res.send({ message: 'Product updated successfully' });
   } catch (err) {
@@ -300,11 +254,16 @@ app.put('/api/products/:id', async (req, res) => {
 /**
  * Delete product by id
  */
-app.delete('/api/products/:id', async (req, res) => {
+app.delete('/api/products/:id', verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
+
+    if (req.user.role !== 'admin')
+      return res.status(403).send({ message: 'Forbidden: Admins only' });
+
     const result = await productsCollection.deleteOne({ _id: new ObjectId(id) });
-    if (result.deletedCount === 0) return res.status(404).send({ message: 'Product not found' });
+    if (result.deletedCount === 0)
+      return res.status(404).send({ message: 'Product not found' });
     res.send({ message: 'Product deleted' });
   } catch (err) {
     console.error('Delete product error:', err);
@@ -344,14 +303,125 @@ app.get('/api/orders', verifyToken, async (req, res) => {
   }
 });
 
-// ================== Admin Routes (protected + admin check) ==================
+// ================== Dashboard / Admin Routes ==================
+
+/**
+ * User dashboard overview (protected)
+ */
+app.get('/api/user/overview', verifyToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+
+    const totalCartProducts = await ordersCollection.countDocuments({
+      email,
+      $or: [{ status: 'pending' }, { status: 'cart' }],
+    });
+
+    const totalPurchasedProducts = await ordersCollection.countDocuments({
+      email,
+      $or: [{ status: 'completed' }, { status: 'purchased' }],
+    });
+
+    const latestOrder = await ordersCollection
+      .find({ email })
+      .sort({ date: -1 })
+      .limit(1)
+      .toArray();
+    const latestOrderStatus = latestOrder.length ? latestOrder[0].status : null;
+
+    const userProfile = await usersCollection.findOne(
+      { email },
+      { projection: { password: 0 } }
+    );
+
+    res.send({
+      totalCartProducts,
+      totalPurchasedProducts,
+      latestOrderStatus,
+      profile: userProfile || null,
+    });
+  } catch (err) {
+    console.error('User overview error:', err);
+    res.status(500).send({ message: 'Failed to fetch user overview' });
+  }
+});
+
+/**
+ * Admin dashboard overview (admin only)
+ */
+app.get('/api/admin/overview', verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin')
+      return res.status(403).send({ message: 'Forbidden' });
+
+    const totalUsers = await usersCollection.estimatedDocumentCount();
+    const totalAdmins = await usersCollection.countDocuments({ role: 'admin' });
+    const totalProducts = await productsCollection.estimatedDocumentCount();
+    const totalSoldProducts = await ordersCollection.countDocuments({
+      $or: [{ status: 'completed' }, { status: 'purchased' }],
+    });
+
+    res.send({
+      totalUsers,
+      totalAdmins,
+      totalProducts,
+      totalSoldProducts,
+    });
+  } catch (err) {
+    console.error('Admin overview error:', err);
+    res.status(500).send({ message: 'Failed to fetch admin overview' });
+  }
+});
+
+/**
+ * Get users (admin only)
+ */
+app.get('/api/admin/users', verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin')
+      return res.status(403).send({ message: 'Forbidden' });
+
+    const users = await usersCollection.find({}, { projection: { password: 0 } }).toArray();
+    res.send(users);
+  } catch (err) {
+    console.error('Admin users error:', err);
+    res.status(500).send({ message: 'Failed to fetch users' });
+  }
+});
+
+/**
+ * Promote user to admin (admin only)
+ */
+app.patch('/api/users/:id/promote', verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin')
+      return res.status(403).send({ message: 'Forbidden' });
+
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) return res.status(400).send({ message: 'Invalid user id' });
+
+    const result = await usersCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { role: 'admin' } }
+    );
+
+    if (result.matchedCount === 0) return res.status(404).send({ message: 'User not found' });
+
+    res.send({ message: 'User promoted to admin' });
+  } catch (err) {
+    console.error('Promote user error:', err);
+    res.status(500).send({ message: 'Failed to promote user' });
+  }
+});
 
 /**
  * Get all orders (admin only)
  */
 app.get('/api/admin/orders', verifyToken, async (req, res) => {
   try {
-    if (req.user.role !== 'admin') return res.status(403).send({ message: 'Forbidden' });
+    if (req.user.role !== 'admin')
+      return res.status(403).send({ message: 'Forbidden' });
+
     const allOrders = await ordersCollection.find().toArray();
     res.send(allOrders);
   } catch (err) {
@@ -365,7 +435,8 @@ app.get('/api/admin/orders', verifyToken, async (req, res) => {
  */
 app.get('/api/admin/stats', verifyToken, async (req, res) => {
   try {
-    if (req.user.role !== 'admin') return res.status(403).send({ message: 'Forbidden' });
+    if (req.user.role !== 'admin')
+      return res.status(403).send({ message: 'Forbidden' });
 
     const totalUsers = await usersCollection.estimatedDocumentCount();
     const totalOrders = await ordersCollection.estimatedDocumentCount();
@@ -383,7 +454,8 @@ app.get('/api/admin/stats', verifyToken, async (req, res) => {
  */
 app.get('/api/admin/recent-orders', verifyToken, async (req, res) => {
   try {
-    if (req.user.role !== 'admin') return res.status(403).send({ message: 'Forbidden' });
+    if (req.user.role !== 'admin')
+      return res.status(403).send({ message: 'Forbidden' });
 
     const recentOrders = await ordersCollection.find().sort({ date: -1 }).limit(5).toArray();
     res.send(recentOrders);
