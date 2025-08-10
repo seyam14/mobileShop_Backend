@@ -59,9 +59,9 @@ function verifyToken(req, res, next) {
     const token = auth.split(' ')[1];
     if (!token) return res.status(401).send({ message: 'Unauthorized: Malformed token' });
 
-    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    jwt.verify(token, process.env.JWT_SECRET || 'your_jwt_secret', (err, decoded) => {
       if (err) return res.status(403).send({ message: 'Forbidden: Invalid token' });
-      req.user = decoded; // { email, role, iat, exp }
+      req.user = decoded; // { email, role, name, iat, exp }
       next();
     });
   } catch (err) {
@@ -70,7 +70,7 @@ function verifyToken(req, res, next) {
   }
 }
 
-// ---------- Swagger ----------
+// ---------- Swagger Setup ----------
 const swaggerSpec = swaggerJsdoc({
   definition: {
     openapi: '3.0.0',
@@ -120,7 +120,6 @@ app.post('/api/register', async (req, res) => {
  *   post:
  *     summary: Login and return JWT token
  */
-
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -136,10 +135,9 @@ app.post('/api/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).send({ message: 'Invalid credentials' });
 
-    // Create JWT token (replace 'your_jwt_secret' with your actual secret)
     const token = jwt.sign(
       { email: user.email, role: user.role, name: user.name || null },
-      'your_jwt_secret',
+      process.env.JWT_SECRET || 'your_jwt_secret',
       { expiresIn: '1h' }
     );
 
@@ -152,7 +150,6 @@ app.post('/api/login', async (req, res) => {
     res.status(500).send({ message: 'Server error during login' });
   }
 });
-
 
 // ================== Product Routes ==================
 
@@ -229,7 +226,10 @@ app.get('/api/products', async (req, res) => {
 });
 
 /**
- * Update product by id
+ * @swagger
+ * /api/products/:id:
+ *   put:
+ *     summary: Update product by id (admin only)
  */
 app.put('/api/products/:id', verifyToken, async (req, res) => {
   try {
@@ -255,7 +255,10 @@ app.put('/api/products/:id', verifyToken, async (req, res) => {
 });
 
 /**
- * Delete product by id
+ * @swagger
+ * /api/products/:id:
+ *   delete:
+ *     summary: Delete product by id (admin only)
  */
 app.delete('/api/products/:id', verifyToken, async (req, res) => {
   try {
@@ -267,6 +270,7 @@ app.delete('/api/products/:id', verifyToken, async (req, res) => {
     const result = await productsCollection.deleteOne({ _id: new ObjectId(id) });
     if (result.deletedCount === 0)
       return res.status(404).send({ message: 'Product not found' });
+
     res.send({ message: 'Product deleted' });
   } catch (err) {
     console.error('Delete product error:', err);
@@ -274,7 +278,23 @@ app.delete('/api/products/:id', verifyToken, async (req, res) => {
   }
 });
 
-// ================== Order Routes (protected) ==================
+/**
+ * @swagger
+ * /api/products/total:
+ *   get:
+ *     summary: Get total products count
+ */
+app.get('/api/products/total', async (req, res) => {
+  try {
+    const totalProducts = await productsCollection.estimatedDocumentCount();
+    res.send({ totalProducts });
+  } catch (err) {
+    console.error('Get total products error:', err);
+    res.status(500).send({ message: 'Failed to fetch total products' });
+  }
+});
+
+// ================== Order Routes ==================
 
 /**
  * Create order (protected)
@@ -330,6 +350,7 @@ app.get('/api/user/overview', verifyToken, async (req, res) => {
       .sort({ date: -1 })
       .limit(1)
       .toArray();
+
     const latestOrderStatus = latestOrder.length ? latestOrder[0].status : null;
 
     const userProfile = await usersCollection.findOne(
@@ -346,6 +367,39 @@ app.get('/api/user/overview', verifyToken, async (req, res) => {
   } catch (err) {
     console.error('User overview error:', err);
     res.status(500).send({ message: 'Failed to fetch user overview' });
+  }
+});
+
+/**
+ * Get current user (protected)
+ */
+app.get('/api/user', verifyToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const user = await usersCollection.findOne({ email }, { projection: { password: 0 } });
+    if (!user) return res.status(404).send({ message: 'User not found' });
+    res.send(user);
+  } catch (err) {
+    console.error('Get current user error:', err);
+    res.status(500).send({ message: 'Server error fetching user data' });
+  }
+});
+
+/**
+ * Get current admin (protected)
+ */
+app.get('/api/admin', verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).send({ message: 'Forbidden: Admins only' });
+    
+    const email = req.user.email;
+    const admin = await usersCollection.findOne({ email, role: 'admin' }, { projection: { password: 0 } });
+    if (!admin) return res.status(404).send({ message: 'Admin not found' });
+    
+    res.send(admin);
+  } catch (err) {
+    console.error('Get current admin error:', err);
+    res.status(500).send({ message: 'Server error fetching admin data' });
   }
 });
 
