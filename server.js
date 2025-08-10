@@ -120,6 +120,7 @@ app.post('/api/register', async (req, res) => {
  *   post:
  *     summary: Login and return JWT token
  */
+
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -135,10 +136,11 @@ app.post('/api/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(401).send({ message: 'Invalid credentials' });
 
+    // Create JWT token (replace 'your_jwt_secret' with your actual secret)
     const token = jwt.sign(
-      { email: user.email, role: user.role || 'user' },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { email: user.email, role: user.role, name: user.name || null },
+      'your_jwt_secret',
+      { expiresIn: '1h' }
     );
 
     res.send({
@@ -150,6 +152,7 @@ app.post('/api/login', async (req, res) => {
     res.status(500).send({ message: 'Server error during login' });
   }
 });
+
 
 // ================== Product Routes ==================
 
