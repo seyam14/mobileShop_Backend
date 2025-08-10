@@ -1,28 +1,44 @@
+// server.js
+require('dotenv').config();
 const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const cors = require('cors');
-const dotenv = require('dotenv');
 const jwt = require('jsonwebtoken');
 const fileUpload = require('express-fileupload');
 const cloudinary = require('cloudinary').v2;
 const bcrypt = require('bcryptjs');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
-
-dotenv.config();
+const { OAuth2Client } = require('google-auth-library');
 
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Middleware
+// ---------- Middleware ----------
 app.use(cors());
 app.use(express.json());
 app.use(fileUpload({ useTempFiles: true }));
 
-// MongoDB Config
-const client = new MongoClient(process.env.MONGO_URI);
+// ---------- Cloudinary ----------
+cloudinary.config({
+  cloud_name: process.env.CLOUD_NAME,
+  api_key: process.env.CLOUD_API_KEY,
+  api_secret: process.env.CLOUD_API_SECRET,
+});
+
+// ---------- Google OAuth client ----------
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+// ---------- MongoDB Setup ----------
+const client = new MongoClient(process.env.MONGO_URI, {
+  useUnifiedTopology: true,
+});
 const dbName = 'SecondHandEcomDB';
-let db, usersCollection, productsCollection, ordersCollection;
+
+let db;
+let usersCollection;
+let productsCollection;
+let ordersCollection;
 
 async function connectDB() {
   try {
@@ -31,45 +47,44 @@ async function connectDB() {
     usersCollection = db.collection('users');
     productsCollection = db.collection('products');
     ordersCollection = db.collection('orders');
-    console.log('✅ MongoDB Connected');
-  } catch (error) {
-    console.error('MongoDB connection failed:', error);
+    console.log('✅ MongoDB connected');
+  } catch (err) {
+    console.error('MongoDB connection error:', err);
+    process.exit(1);
   }
 }
 
-// JWT Verify
+// ---------- JWT middleware ----------
 function verifyToken(req, res, next) {
-  const auth = req.headers.authorization;
-  if (!auth) return res.status(401).send('Unauthorized');
-  const token = auth.split(' ')[1];
-  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-    if (err) return res.status(403).send('Forbidden');
-    req.user = decoded;
-    next();
-  });
+  try {
+    const auth = req.headers.authorization || req.headers.Authorization;
+    if (!auth) return res.status(401).send({ message: 'Unauthorized: No token' });
+
+    const token = auth.split(' ')[1];
+    if (!token) return res.status(401).send({ message: 'Unauthorized: Malformed token' });
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+      if (err) return res.status(403).send({ message: 'Forbidden: Invalid token' });
+      req.user = decoded; // { email, role, iat, exp }
+      next();
+    });
+  } catch (err) {
+    console.error('verifyToken error:', err);
+    res.status(500).send({ message: 'Server error in auth' });
+  }
 }
 
-// Cloudinary Config
-cloudinary.config({
-  cloud_name: process.env.CLOUD_NAME,
-  api_key: process.env.CLOUD_API_KEY,
-  api_secret: process.env.CLOUD_API_SECRET,
-});
-
-// Swagger Docs
+// ---------- Swagger ----------
 const swaggerSpec = swaggerJsdoc({
   definition: {
     openapi: '3.0.0',
-    info: {
-      title: 'Second-Hand Mobile E-Commerce API',
-      version: '1.0.0',
-    },
+    info: { title: 'Second-Hand Mobile E-Commerce API', version: '1.0.0' },
   },
   apis: ['./server.js'],
 });
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
-// ================== Auth Routes ================== //
+// ================== Auth Routes ==================
 
 /**
  * @swagger
@@ -78,12 +93,28 @@ app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
  *     summary: Register a new user
  */
 app.post('/api/register', async (req, res) => {
-  const { email, password, role } = req.body;
-  const user = await usersCollection.findOne({ email });
-  if (user) return res.status(400).send('User already exists');
-  const hashedPassword = await bcrypt.hash(password, 10);
-  await usersCollection.insertOne({ email, password: hashedPassword, role: role || 'user' });
-  res.send({ message: 'User registered' });
+  try {
+    const { email, password, role, name } = req.body;
+    if (!email || !password) return res.status(400).send({ message: 'Email and password required' });
+
+    const existing = await usersCollection.findOne({ email });
+    if (existing) return res.status(400).send({ message: 'User already exists' });
+
+    const hashed = await bcrypt.hash(password, 10);
+    const result = await usersCollection.insertOne({
+      email,
+      password: hashed,
+      role: role || 'user',
+      name: name || null,
+      provider: 'local',
+      createdAt: new Date(),
+    });
+
+    res.send({ message: 'User registered', userId: result.insertedId });
+  } catch (err) {
+    console.error('Register error:', err);
+    res.status(500).send({ message: 'Server error registering user' });
+  }
 });
 
 /**
@@ -93,140 +124,297 @@ app.post('/api/register', async (req, res) => {
  *     summary: Login and return JWT token
  */
 app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body;
-  const user = await usersCollection.findOne({ email });
-  if (!user) return res.status(401).send('Invalid credentials');
-  const isMatch = await bcrypt.compare(password, user.password);
-  if (!isMatch) return res.status(401).send('Invalid credentials');
-  const token = jwt.sign({ email, role: user.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
-  res.send({ token });
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).send({ message: 'Email and password required' });
+
+    const user = await usersCollection.findOne({ email });
+    if (!user) return res.status(401).send({ message: 'Invalid credentials' });
+
+    // If user was created by Google and has no password
+    if (!user.password) return res.status(400).send({ message: 'Please login with Google or set a password' });
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(401).send({ message: 'Invalid credentials' });
+
+    const token = jwt.sign({ email: user.email, role: user.role || 'user' }, process.env.JWT_SECRET, {
+      expiresIn: '7d',
+    });
+
+    res.send({ token, user: { email: user.email, role: user.role, name: user.name || null } });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).send({ message: 'Server error during login' });
+  }
 });
 
-// ================== Product Routes ================== //
+/**
+ * @swagger
+ * /api/google-login:
+ *   post:
+ *     summary: Login or register using Google OAuth
+ */
+app.post('/api/google-login', async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).send({ message: 'No token provided' });
 
+    const ticket = await googleClient.verifyIdToken({
+      idToken: token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    const email = payload.email;
+    const name = payload.name;
+    const picture = payload.picture;
+
+    // Find or create user
+    let user = await usersCollection.findOne({ email });
+
+    if (!user) {
+      const newUser = {
+        email,
+        name: name || null,
+        picture: picture || null,
+        password: null, // no local password
+        role: 'user',
+        provider: 'google',
+        createdAt: new Date(),
+      };
+      const insertRes = await usersCollection.insertOne(newUser);
+      newUser._id = insertRes.insertedId;
+      user = newUser;
+    } else {
+      // If user exists but provider not set, optionally set provider to google
+      if (!user.provider) {
+        await usersCollection.updateOne({ _id: user._id }, { $set: { provider: user.provider || 'google' } });
+      }
+    }
+
+    const jwtToken = jwt.sign({ email: user.email, role: user.role || 'user' }, process.env.JWT_SECRET, {
+      expiresIn: '7d',
+    });
+
+    res.send({
+      token: jwtToken,
+      user: { email: user.email, role: user.role, name: user.name || null, picture: user.picture || null },
+    });
+  } catch (err) {
+    console.error('Google login error:', err);
+    res.status(500).send({ message: 'Google login failed' });
+  }
+});
+
+// ================== Product Routes ==================
+
+/**
+ * @swagger
+ * /api/upload:
+ *   post:
+ *     summary: Upload product image to Cloudinary
+ */
 app.post('/api/upload', async (req, res) => {
-  const file = req.files?.image;
-  if (!file) return res.status(400).send('No image uploaded');
-  const result = await cloudinary.uploader.upload(file.tempFilePath, {
-    folder: 'ecom-secondhand',
-  });
-  res.send({ url: result.secure_url });
+  try {
+    const file = req.files?.image;
+    if (!file) return res.status(400).send({ message: 'No image uploaded' });
+
+    const result = await cloudinary.uploader.upload(file.tempFilePath, {
+      folder: 'ecom-secondhand',
+    });
+
+    res.send({ url: result.secure_url, public_id: result.public_id });
+  } catch (err) {
+    console.error('Upload error:', err);
+    res.status(500).send({ message: 'Image upload failed' });
+  }
 });
 
-app.post('/api/products',  async (req, res) => {
-  const product = req.body;
-  const result = await productsCollection.insertOne(product);
-  res.send(result);
+/**
+ * @swagger
+ * /api/products:
+ *   post:
+ *     summary: Create a product
+ */
+app.post('/api/products', async (req, res) => {
+  try {
+    const product = req.body;
+    product.createdAt = new Date();
+    const result = await productsCollection.insertOne(product);
+    res.send({ message: 'Product created', id: result.insertedId });
+  } catch (err) {
+    console.error('Create product error:', err);
+    res.status(500).send({ message: 'Failed to create product' });
+  }
 });
 
+/**
+ * @swagger
+ * /api/products:
+ *   get:
+ *     summary: Get products (filter by category/company optional)
+ */
 app.get('/api/products', async (req, res) => {
-  const category = req.query.category;
-  const company = req.query.company;
+  try {
+    const { category, company, q } = req.query;
 
-  let filter = {};
-  if (category) filter.category = category;
-  if (company) filter.company = company;
+    const filter = {};
+    if (category) filter.category = category;
+    if (company) filter.company = company;
+    if (q) {
+      // simple text search across some fields
+      filter.$or = [
+        { name: { $regex: q, $options: 'i' } },
+        { description: { $regex: q, $options: 'i' } },
+        { company: { $regex: q, $options: 'i' } },
+      ];
+    }
 
-  const result = await productsCollection.find(filter).toArray();
-  res.send(result);
+    const products = await productsCollection.find(filter).toArray();
+    res.send(products);
+  } catch (err) {
+    console.error('Get products error:', err);
+    res.status(500).send({ message: 'Failed to fetch products' });
+  }
 });
-// Update product by id
-app.put('/api/products/:id',  async (req, res) => {
+
+/**
+ * Update product by id
+ */
+app.put('/api/products/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const updatedProduct = req.body;
 
-    // Optional: You can validate fields here before updating
+    const result = await productsCollection.updateOne({ _id: new ObjectId(id) }, { $set: updatedProduct });
 
-    const result = await productsCollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: updatedProduct }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).send({ message: 'Product not found' });
-    }
+    if (result.matchedCount === 0) return res.status(404).send({ message: 'Product not found' });
 
     res.send({ message: 'Product updated successfully' });
-  } catch (error) {
-    console.error('Error updating product:', error);
+  } catch (err) {
+    console.error('Update product error:', err);
     res.status(500).send({ message: 'Failed to update product' });
   }
 });
 
-
+/**
+ * Delete product by id
+ */
 app.delete('/api/products/:id', async (req, res) => {
-  const result = await productsCollection.deleteOne({ _id: new ObjectId(req.params.id) });
-  res.send(result);
-});
-
-// ================== Order Routes ================== //
-
-app.post('/api/orders',  async (req, res) => {
-  const order = req.body;
-  order.email = req.user.email;
-  order.date = new Date();
-  const result = await ordersCollection.insertOne(order);
-  res.send(result);
-});
-
-app.get('/api/orders',  async (req, res) => {
-  const email = req.user.email;
-  const result = await ordersCollection.find({ email }).toArray();
-  res.send(result);
-});
-
-// ================== Admin Routes ================== //
-
-app.get('/api/admin/orders',  async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).send('Forbidden');
-  const result = await ordersCollection.find().toArray();
-  res.send(result);
-});
-
-// 🔹 Admin Dashboard Stats
-app.get('/api/admin/stats',  async (req, res) => {
   try {
-    if (req.user.role !== 'admin') return res.status(403).send('Forbidden');
+    const { id } = req.params;
+    const result = await productsCollection.deleteOne({ _id: new ObjectId(id) });
+    if (result.deletedCount === 0) return res.status(404).send({ message: 'Product not found' });
+    res.send({ message: 'Product deleted' });
+  } catch (err) {
+    console.error('Delete product error:', err);
+    res.status(500).send({ message: 'Failed to delete product' });
+  }
+});
+
+// ================== Order Routes (protected) ==================
+
+/**
+ * Create order (protected)
+ */
+app.post('/api/orders', verifyToken, async (req, res) => {
+  try {
+    const order = req.body;
+    order.email = req.user.email;
+    order.date = new Date();
+    const result = await ordersCollection.insertOne(order);
+    res.send({ message: 'Order placed', id: result.insertedId });
+  } catch (err) {
+    console.error('Create order error:', err);
+    res.status(500).send({ message: 'Failed to create order' });
+  }
+});
+
+/**
+ * Get user orders (protected)
+ */
+app.get('/api/orders', verifyToken, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const orders = await ordersCollection.find({ email }).toArray();
+    res.send(orders);
+  } catch (err) {
+    console.error('Get orders error:', err);
+    res.status(500).send({ message: 'Failed to fetch orders' });
+  }
+});
+
+// ================== Admin Routes (protected + admin check) ==================
+
+/**
+ * Get all orders (admin only)
+ */
+app.get('/api/admin/orders', verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).send({ message: 'Forbidden' });
+    const allOrders = await ordersCollection.find().toArray();
+    res.send(allOrders);
+  } catch (err) {
+    console.error('Admin get orders error:', err);
+    res.status(500).send({ message: 'Server error' });
+  }
+});
+
+/**
+ * Admin stats
+ */
+app.get('/api/admin/stats', verifyToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).send({ message: 'Forbidden' });
 
     const totalUsers = await usersCollection.estimatedDocumentCount();
     const totalOrders = await ordersCollection.estimatedDocumentCount();
     const totalProducts = await productsCollection.estimatedDocumentCount();
 
-    res.send({
-      users: totalUsers,
-      orders: totalOrders,
-      products: totalProducts
-    });
+    res.send({ users: totalUsers, orders: totalOrders, products: totalProducts });
   } catch (err) {
-    res.status(500).send('Server error while fetching stats');
+    console.error('Admin stats error:', err);
+    res.status(500).send({ message: 'Server error' });
   }
 });
 
-// 🔹 Admin Dashboard Recent Orders
-app.get('/api/admin/recent-orders',  async (req, res) => {
+/**
+ * Admin recent orders
+ */
+app.get('/api/admin/recent-orders', verifyToken, async (req, res) => {
   try {
-    if (req.user.role !== 'admin') return res.status(403).send('Forbidden');
+    if (req.user.role !== 'admin') return res.status(403).send({ message: 'Forbidden' });
 
-    const recentOrders = await ordersCollection
-      .find()
-      .sort({ date: -1 })
-      .limit(5)
-      .toArray();
-
+    const recentOrders = await ordersCollection.find().sort({ date: -1 }).limit(5).toArray();
     res.send(recentOrders);
   } catch (err) {
-    res.status(500).send('Server error while fetching recent orders');
+    console.error('Admin recent orders error:', err);
+    res.status(500).send({ message: 'Server error' });
   }
 });
 
-// ================== Root ================== //
+// ================== Misc / Root ==================
 app.get('/', (req, res) => {
   res.send('📱 Second-hand eCommerce Backend Running');
 });
 
-// ================== Start Server ================== //
-app.listen(port, () => {
-  connectDB();
-  console.log(`🚀 Server is running on http://localhost:${port}`);
+// ---------- Start server after DB connection ----------
+(async () => {
+  await connectDB();
+  app.listen(port, () => {
+    console.log(`🚀 Server running on http://localhost:${port}`);
+    console.log(`📚 Swagger UI: http://localhost:${port}/api-docs`);
+  });
+})();
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('SIGINT received: closing MongoDB connection');
+  try {
+    await client.close();
+    console.log('MongoDB connection closed');
+  } catch (err) {
+    console.error('Error closing MongoDB:', err);
+  }
+  process.exit(0);
 });
